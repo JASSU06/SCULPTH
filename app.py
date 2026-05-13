@@ -140,39 +140,41 @@ def _yf_symbol(symbol: str, exchange: str = "NSE") -> str:
 
 def fetch_prices(symbol: str, exchange: str, period: str) -> list:
     """
-    Download adjusted-close prices via yfinance for the given period.
-    Returns a plain Python list of floats (ascending date order).
-
-    Strategy:
-      1. Try NSE (.NS) — covers ~95% of Indian blue chips.
-      2. If empty, fall back to BSE (.BO).
-      3. If still empty, raise DataFetchError — no fake prices ever returned.
-
-    STRICT scalar guarantee: every element comes from .tolist() which
-    converts numpy scalars to native Python floats before they touch math.
+    Download adjusted-close prices via yfinance using a browser-mimicking session.
     """
+    import requests
+    from requests import Session
+
+    # Create a session to mimic a real browser request from India
+    session = Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+
+    # Try NSE first (.NS), then fall back to BSE (.BO)
     for suffix in (".NS", ".BO"):
         yf_sym = symbol.upper().strip() + suffix
         try:
-            hist = yf.Ticker(yf_sym).history(period=period, auto_adjust=True)
+            # Pass the session to the Ticker
+            ticker = yf.Ticker(yf_sym, session=session)
+            hist = ticker.history(period=period, auto_adjust=True)
+
             if hist.empty or len(hist) < 5:
                 continue
 
-            # ── STRICT extraction: tolist() → native Python floats ───
+            # STRICT extraction to native Python floats
             raw_closes = hist["Close"].dropna().tolist()
-            closes = [float(c) for c in raw_closes]   # belt-and-suspenders cast
+            closes = [float(c) for c in raw_closes]
 
             if len(closes) >= 10:
                 return closes
 
-        except Exception:
-            continue   # try next suffix
+        except Exception as e:
+            print(f"Error fetching {yf_sym}: {e}")
+            continue 
 
     raise DataFetchError(
-        f"yfinance returned insufficient data for '{symbol}' "
-        f"(tried {symbol}.NS and {symbol}.BO) over the '{period}' period. "
-        "Verify the symbol is NSE/BSE-listed and that the requested window "
-        "predates the stock's listing date."
+        f"yfinance returned insufficient data for '{symbol}' after trying both NSE/BSE."
     )
 
 
