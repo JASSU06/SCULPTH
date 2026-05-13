@@ -1,10 +1,10 @@
 # SCULPTH | Sculpt Ur Wealth — Python Backend Dependencies
 # Install with: pip install -r requirements.txt
 
-flask
-flask-cors
-yfinance
+flask==3.0.3
+flask-cors==4.0.1
+yfinance==0.2.40
 numpy==1.26.4
-scipy
-gunicorn
+scipy==1.13.1
+gunicorn==22.0.0
 pandas==2.2.2
