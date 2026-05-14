@@ -427,18 +427,28 @@ def analyze_portfolio():
             shares   = float(asset["shares"])
 
             # fetch_prices raises DataFetchError if no data — never returns fake prices
-            price_series = fetch_prices(sym, exchange, period)
+           try:
+                # 1. Fetch prices
+                price_series = fetch_prices(sym, exchange, period)
+                latest_price = float(price_series[-1])
 
-            # STRICT: latest price as a plain Python float
-            latest_price = float(price_series[-1])
+                if latest_price <= 0:
+                    print(f"Skipping {sym}: Invalid price.")
+                    continue
 
-            if latest_price <= 0:
-                return jsonify({
-                    "error": f"Invalid latest price (₹{latest_price:.2f}) for {sym}. "
-                             "Symbol may be delisted or suspended."
-                }), 400
+                # 2. Process math
+                log_rets = daily_log_returns(price_series)
 
-            log_rets = daily_log_returns(price_series)
+                # 3. If everything is okay, add to the main lists
+                symbols.append(sym)
+                shares_list.append(shares)
+                prices_list.append(latest_price)
+                returns_matrix.append(log_rets)
+                raw_prices_all.append(price_series)
+
+            except Exception as e:
+                print(f"Error processing {sym}: {e}")
+                continue # This 'continue' is the magic—it moves to the next stock!
 
             symbols.append(sym)
             shares_list.append(shares)
