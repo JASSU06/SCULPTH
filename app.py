@@ -142,39 +142,57 @@ def fetch_prices(symbol: str, exchange: str, period: str) -> list:
     """
     Download adjusted-close prices via yfinance using a browser-mimicking session.
     """
-    import requests
-    from requests import Session
+    import requests as _requests
 
-    # Create a session to mimic a real browser request from India
-    session = Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
+# ── One shared session with a real browser User-Agent.
+# Render's cloud IPs (AWS) are blocked by Yahoo Finance without this.
+_YF_SESSION = _requests.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+})
 
-    # Try NSE first (.NS), then fall back to BSE (.BO)
+
+def fetch_prices(symbol: str, exchange: str, period: str) -> list:
+    """
+    Download adjusted-close prices via yfinance.
+    Uses a shared requests.Session with a browser User-Agent to prevent
+    Yahoo Finance from blocking cloud-hosted servers (Render / AWS).
+
+    Strategy:
+      1. Try SYMBOL.NS  (NSE — widest Indian coverage)
+      2. Fall back to SYMBOL.BO  (BSE)
+      3. If both fail, raise DataFetchError (caller decides how to handle)
+    """
     for suffix in (".NS", ".BO"):
         yf_sym = symbol.upper().strip() + suffix
         try:
-            # Pass the session to the Ticker
-            ticker = yf.Ticker(yf_sym, session=session)
-            hist = ticker.history(period=period, auto_adjust=True)
+            ticker = yf.Ticker(yf_sym, session=_YF_SESSION)
+            hist   = ticker.history(period=period, auto_adjust=True)
 
-            if hist.empty or len(hist) < 5:
+            if hist is None or hist.empty or len(hist) < 5:
                 continue
 
-            # STRICT extraction to native Python floats
-            raw_closes = hist["Close"].dropna().tolist()
-            closes = [float(c) for c in raw_closes]
+            # .tolist() guarantees native Python floats — no pandas Series
+            # ever reaches a math operation downstream.
+            closes = [float(c) for c in hist["Close"].dropna().tolist()]
 
             if len(closes) >= 10:
-                return closes
+                return closes   # ← success path
 
-        except Exception as e:
-            print(f"Error fetching {yf_sym}: {e}")
-            continue 
+        except Exception:
+            continue   # try next suffix
 
     raise DataFetchError(
-        f"yfinance returned insufficient data for '{symbol}' after trying both NSE/BSE."
+        f"Could not fetch price history for '{symbol}' "
+        f"(tried {symbol}.NS and {symbol}.BO) over the '{period}' window. "
+        "Possible causes: symbol not NSE/BSE-listed, window predates listing, "
+        "or Yahoo Finance is temporarily rate-limiting this server."
     )
 
 
@@ -414,41 +432,39 @@ def analyze_portfolio():
             }), 400
 
         # ── Step 1: Fetch price histories + sectors ──────────────────
+       # ── Step 1: Fetch price histories + sectors ──────────────────
+        # Each stock is wrapped individually. A single bad ticker
+        # is skipped with a warning; it does NOT crash the whole request.
         symbols        = []
         shares_list    = []
         prices_list    = []
         returns_matrix = []
         raw_prices_all = []
         sector_local   = {}
+        skipped        = []   # track stocks we couldn't fetch data for
 
         for asset in valid_assets:
             sym      = str(asset["symbol"]).upper().strip()
             exchange = str(asset.get("exchange", "NSE")).upper()
             shares   = float(asset["shares"])
 
-            # fetch_prices raises DataFetchError if no data — never returns fake prices
-           try:
-                # 1. Fetch prices
+            # ── Per-stock isolation: skip and warn, don't crash ──────
+            try:
                 price_series = fetch_prices(sym, exchange, period)
-                latest_price = float(price_series[-1])
+            except DataFetchError as fetch_err:
+                # Log on the server; tell the user which symbols were skipped.
+                print(f"[SCULPTH] Skipping {sym}: {fetch_err}")
+                skipped.append(sym)
+                continue   # ← key change: skip this stock, keep going
 
-                if latest_price <= 0:
-                    print(f"Skipping {sym}: Invalid price.")
-                    continue
+            latest_price = float(price_series[-1])
 
-                # 2. Process math
-                log_rets = daily_log_returns(price_series)
+            if latest_price <= 0:
+                print(f"[SCULPTH] Skipping {sym}: invalid price {latest_price}")
+                skipped.append(sym)
+                continue
 
-                # 3. If everything is okay, add to the main lists
-                symbols.append(sym)
-                shares_list.append(shares)
-                prices_list.append(latest_price)
-                returns_matrix.append(log_rets)
-                raw_prices_all.append(price_series)
-
-            except Exception as e:
-                print(f"Error processing {sym}: {e}")
-                continue # This 'continue' is the magic—it moves to the next stock!
+            log_rets = daily_log_returns(price_series)
 
             symbols.append(sym)
             shares_list.append(shares)
@@ -456,16 +472,30 @@ def analyze_portfolio():
             returns_matrix.append(log_rets)
             raw_prices_all.append(price_series)
 
-            # Sector: use frontend-passed value to save a network call;
-            # fall back to fetch_sector() only when the badge wasn't populated.
             fe_sector = str(asset.get("sector", "")).strip()
             if fe_sector and fe_sector not in ("—", "", "Diversified"):
-                _sector_cache[sym] = fe_sector
-                sector_local[sym]  = fe_sector
+                _sector_cache[sym]  = fe_sector
+                sector_local[sym]   = fe_sector
             else:
                 sector_local[sym] = fetch_sector(sym, exchange)
 
         n = len(symbols)
+
+        # ── Need at least 2 stocks with real data to run optimization ─
+        if n < 2:
+            skipped_str = ", ".join(skipped) if skipped else "unknown symbols"
+            return jsonify({
+                "error": (
+                    f"Only {n} stock(s) returned usable price data "
+                    f"(needed ≥ 2 to run optimization). "
+                    f"Symbols that failed: {skipped_str}. "
+                    "Try: shorter duration, verified NSE-listed symbols, "
+                    "or wait 60 s for Yahoo Finance rate limits to reset."
+                ),
+                "error_type": "insufficient_data",
+                "failed_symbols": skipped,
+                "successful_symbols": symbols,
+            }), 422   # 422 Unprocessable Entity — not a bad request, bad upstream data
 
         # ── Step 2: Align all return series to the same length ───────
         min_len = min(len(r) for r in returns_matrix)
@@ -688,11 +718,17 @@ def analyze_portfolio():
         })
 
     except DataFetchError as exc:
-        # No data from yfinance — hard 400, no fallback fake prices
+        # DataFetchError = yfinance / Yahoo Finance upstream failure.
+        # This is NOT a bad client request (not 400).
+        # 502 Bad Gateway correctly signals "our server tried, upstream failed."
         return jsonify({
             "error": str(exc),
             "error_type": "data_error",
-        }), 400
+            "hint": (
+                "Yahoo Finance may be rate-limiting Render's server IP. "
+                "Wait 60 s and retry, or try different symbols."
+            ),
+        }), 502
 
     except Exception:
         print(traceback.format_exc())
